@@ -18,7 +18,6 @@ import (
 	"github.com/neelance/graphql-go/internal/schema"
 )
 
-// keep in sync with main package
 const OpenTracingTagType = "graphql.type"
 const OpenTracingTagField = "graphql.field"
 const OpenTracingTagTrivial = "graphql.trivial"
@@ -292,6 +291,7 @@ type request struct {
 	schema *schema.Schema
 	mu     sync.Mutex
 	errs   []*errors.QueryError
+	serial bool
 }
 
 func (r *request) addError(err *errors.QueryError) {
@@ -318,12 +318,6 @@ func ExecuteRequest(ctx context.Context, e *Exec, document *query.Document, oper
 		return nil, []*errors.QueryError{errors.Errorf("%s", err)}
 	}
 
-	r := &request{
-		doc:    document,
-		vars:   variables,
-		schema: e.schema,
-	}
-
 	var opExec iExec
 	var serially bool
 	switch op.Type {
@@ -335,9 +329,16 @@ func ExecuteRequest(ctx context.Context, e *Exec, document *query.Document, oper
 		serially = true
 	}
 
+	r := &request{
+		doc:    document,
+		vars:   variables,
+		schema: e.schema,
+		serial: serially,
+	}
+
 	data := func() interface{} {
 		defer r.handlePanic()
-		return opExec.exec(ctx, r, op.SelSet, e.resolver, serially)
+		return opExec.exec(ctx, r, op.SelSet, e.resolver)
 	}()
 
 	return data, r.errs
@@ -365,12 +366,12 @@ func getOperation(document *query.Document, operationName string) (*query.Operat
 }
 
 type iExec interface {
-	exec(ctx context.Context, r *request, selSet *query.SelectionSet, resolver reflect.Value, serially bool) interface{}
+	exec(ctx context.Context, r *request, selSet *query.SelectionSet, resolver reflect.Value) interface{}
 }
 
 type scalarExec struct{}
 
-func (e *scalarExec) exec(ctx context.Context, r *request, selSet *query.SelectionSet, resolver reflect.Value, serially bool) interface{} {
+func (e *scalarExec) exec(ctx context.Context, r *request, selSet *query.SelectionSet, resolver reflect.Value) interface{} {
 	return resolver.Interface()
 }
 
@@ -379,7 +380,7 @@ type listExec struct {
 	nonNull bool
 }
 
-func (e *listExec) exec(ctx context.Context, r *request, selSet *query.SelectionSet, resolver reflect.Value, serially bool) interface{} {
+func (e *listExec) exec(ctx context.Context, r *request, selSet *query.SelectionSet, resolver reflect.Value) interface{} {
 	if !e.nonNull {
 		if resolver.IsNil() {
 			return nil
@@ -388,13 +389,19 @@ func (e *listExec) exec(ctx context.Context, r *request, selSet *query.Selection
 	}
 	l := make([]interface{}, resolver.Len())
 	var wg sync.WaitGroup
+	serial := r.serial
 	for i := range l {
 		wg.Add(1)
-		go func(i int) {
+		reslv := func(i int) {
 			defer wg.Done()
 			defer r.handlePanic()
-			l[i] = e.elem.exec(ctx, r, selSet, resolver.Index(i), false)
-		}(i)
+			l[i] = e.elem.exec(ctx, r, selSet, resolver.Index(i))
+		}
+		if serial {
+			reslv(i)
+		} else {
+			go reslv(i)
+		}
 	}
 	wg.Wait()
 	return l
@@ -410,7 +417,7 @@ type objectExec struct {
 
 type addResultFn func(key string, value interface{})
 
-func (e *objectExec) exec(ctx context.Context, r *request, selSet *query.SelectionSet, resolver reflect.Value, serially bool) interface{} {
+func (e *objectExec) exec(ctx context.Context, r *request, selSet *query.SelectionSet, resolver reflect.Value) interface{} {
 	if resolver.IsNil() {
 		if e.nonNull {
 			r.addError(errors.Errorf("got nil for non-null %q", e.name))
@@ -424,15 +431,15 @@ func (e *objectExec) exec(ctx context.Context, r *request, selSet *query.Selecti
 		results[key] = value
 		mu.Unlock()
 	}
-	e.execSelectionSet(ctx, r, selSet, resolver, addResult, serially)
+	e.execSelectionSet(ctx, r, selSet, resolver, addResult)
 	return results
 }
 
-func (e *objectExec) execSelectionSet(ctx context.Context, r *request, selSet *query.SelectionSet, resolver reflect.Value, addResult addResultFn, serially bool) {
+func (e *objectExec) execSelectionSet(ctx context.Context, r *request, selSet *query.SelectionSet, resolver reflect.Value, addResult addResultFn) {
 	var wg sync.WaitGroup
 	for _, sel := range selSet.Selections {
 		execSel := func(f func()) {
-			if serially {
+			if r.serial {
 				defer r.handlePanic()
 				f()
 				return
@@ -526,10 +533,10 @@ func (e *objectExec) execFragment(ctx context.Context, r *request, frag *query.F
 		if !out[1].Bool() {
 			return
 		}
-		a.typeExec.(*objectExec).execSelectionSet(ctx, r, frag.SelSet, out[0], addResult, false)
+		a.typeExec.(*objectExec).execSelectionSet(ctx, r, frag.SelSet, out[0], addResult)
 		return
 	}
-	e.execSelectionSet(ctx, r, frag.SelSet, resolver, addResult, false)
+	e.execSelectionSet(ctx, r, frag.SelSet, resolver, addResult)
 }
 
 type fieldExec struct {
@@ -589,7 +596,7 @@ func (e *fieldExec) execField2(ctx context.Context, r *request, f *query.Field, 
 		return nil, out[1].Interface().(error)
 	}
 
-	return e.valueExec.exec(ctx, r, f.SelSet, out[0], false), nil
+	return e.valueExec.exec(ctx, r, f.SelSet, out[0]), nil
 }
 
 type typeAssertExec struct {

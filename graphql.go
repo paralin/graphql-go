@@ -19,11 +19,11 @@ const OpenTracingTagQuery = "graphql.query"
 const OpenTracingTagOperationName = "graphql.operationName"
 const OpenTracingTagVariables = "graphql.variables"
 
-const OpenTracingTagType = "graphql.type"
-const OpenTracingTagField = "graphql.field"
-const OpenTracingTagTrivial = "graphql.trivial"
-const OpenTracingTagArgsPrefix = "graphql.args."
-const OpenTracingTagError = "graphql.error"
+const OpenTracingTagType = exec.OpenTracingTagType
+const OpenTracingTagField = exec.OpenTracingTagField
+const OpenTracingTagTrivial = exec.OpenTracingTagTrivial
+const OpenTracingTagArgsPrefix = exec.OpenTracingTagArgsPrefix
+const OpenTracingTagError = exec.OpenTracingTagError
 
 type ID string
 
