@@ -76,6 +76,11 @@ func (r *Schema) Directives() []*Directive {
 				}},
 			},
 		},
+		{
+			name:        "defer",
+			description: "Directs the executor to defer resolving this field or fragment until the initial response is complete.",
+			locations:   []string{"FIELD", "FRAGMENT_SPREAD", "INLINE_FRAGMENT"},
+		},
 	}
 }
 

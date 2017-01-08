@@ -128,6 +128,35 @@ func TestBasic(t *testing.T) {
 	})
 }
 
+/*
+func TestDefer(t *testing.T) {
+	graphql.RunTests(t, []*graphql.Test{
+		{
+			Schema: starwarsSchema,
+			Query: `
+				{
+					hero {
+						id
+						name
+						friends @defer {
+							name
+						}
+					}
+				}
+			`,
+			ExpectedResult: `
+				{
+					"hero": {
+						"id": "2001",
+						"name": "R2-D2"
+					}
+				}
+			`,
+		},
+	})
+}
+*/
+
 func TestArguments(t *testing.T) {
 	graphql.RunTests(t, []*graphql.Test{
 		{
@@ -1177,6 +1206,14 @@ func TestIntrospection(t *testing.T) {
 											}
 										}
 									]
+								},
+								{
+									"args": [],
+									"description": "Directs the executor to defer resolving this field until the initial query is complete.",
+									"locations": [
+										"FIELD"
+									],
+									"name": "defer"
 								}
 							]
 						}
