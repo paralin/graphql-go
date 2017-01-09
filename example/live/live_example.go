@@ -32,24 +32,33 @@ schema {
 type RootResolver struct {
 }
 
-func (r *RootResolver) Regions() *[]*RegionResolver {
-	return &[]*RegionResolver{
-		{
-			id:    "test",
-			name:  "test region",
-			delay: time.Duration(0),
-		},
-		{
-			id:    "test2",
-			name:  "test region, delayed by 500ms",
-			delay: time.Duration(500) * time.Millisecond,
-		},
-		{
-			id:    "test3",
-			name:  "test region, delayed by 1sec",
-			delay: time.Duration(1) * time.Second,
-		},
-	}
+func (r *RootResolver) Regions() <-chan *RegionResolver {
+	ch := make(chan *RegionResolver, 1)
+	go func() {
+		arr := []*RegionResolver{
+			{
+				id:    "test",
+				name:  "test region",
+				delay: time.Duration(0),
+			},
+			{
+				id:    "test2",
+				name:  "test region, delayed by 500ms",
+				delay: time.Duration(500) * time.Millisecond,
+			},
+			{
+				id:    "test3",
+				name:  "test region, delayed by 1sec",
+				delay: time.Duration(1) * time.Second,
+			},
+		}
+
+		for _, thing := range arr {
+			ch <- thing
+		}
+		close(ch)
+	}()
+	return ch
 }
 
 type RegionResolver struct {

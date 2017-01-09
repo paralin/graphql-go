@@ -104,8 +104,12 @@ func makeExec2(s *schema.Schema, t common.Type, resolverType reflect.Type, typeR
 	t, nonNull = unwrapNonNull(t)
 
 	if !nonNull {
-		if resolverType.Kind() != reflect.Ptr && resolverType.Kind() != reflect.Interface {
-			return nil, fmt.Errorf("%s is not a pointer or interface", resolverType)
+		resolverTypeKind := resolverType.Kind()
+		if resolverTypeKind != reflect.Ptr &&
+			resolverTypeKind != reflect.Interface &&
+			resolverTypeKind != reflect.Chan &&
+			resolverTypeKind != reflect.Slice {
+			return nil, fmt.Errorf("%s is not a pointer or interface or nullable type", resolverType)
 		}
 	}
 
@@ -164,17 +168,29 @@ func makeExec2(s *schema.Schema, t common.Type, resolverType reflect.Type, typeR
 		return &scalarExec{}, nil
 
 	case *common.List:
-		if !nonNull {
+		resolverTypeKind := resolverType.Kind()
+		if !nonNull && resolverTypeKind != reflect.Chan {
 			resolverType = resolverType.Elem()
+			resolverTypeKind = resolverType.Kind()
 		}
-		if resolverType.Kind() != reflect.Slice {
-			return nil, fmt.Errorf("%s is not a slice", resolverType)
+		if resolverTypeKind == reflect.Slice {
+			e := &listExec{nonNull: nonNull}
+			if err := makeExec(&e.elem, s, t.OfType, resolverType.Elem(), typeRefMap); err != nil {
+				return nil, err
+			}
+			return e, nil
+		} else if resolverTypeKind == reflect.Chan {
+			if resolverType.ChanDir() != reflect.RecvDir {
+				return nil, fmt.Errorf("%s must be a recv chan (<-*ResolverType)", resolverType)
+			}
+			e := &chanExec{nonNull: nonNull}
+			if err := makeExec(&e.elem, s, t.OfType, resolverType.Elem(), typeRefMap); err != nil {
+				return nil, err
+			}
+			return e, nil
+		} else {
+			return nil, fmt.Errorf("%s is not a slice or channel (%v)", resolverType, resolverTypeKind)
 		}
-		e := &listExec{nonNull: nonNull}
-		if err := makeExec(&e.elem, s, t.OfType, resolverType.Elem(), typeRefMap); err != nil {
-			return nil, err
-		}
-		return e, nil
 
 	default:
 		panic("invalid type")
@@ -456,6 +472,106 @@ func (e *listExec) exec(ctx context.Context, r *request, selSet *query.Selection
 	return l
 }
 
+type chanExec struct {
+	elem    iExec
+	nonNull bool
+}
+
+func (e *chanExec) exec(ctx context.Context, r *request, selSet *query.SelectionSet, resolver reflect.Value, path FieldPath, parentField *query.Field) interface{} {
+	done := ctx.Done()
+	doneVal := reflect.ValueOf(done)
+	if !e.nonNull {
+		if resolver.IsNil() {
+			return nil
+		}
+		if resolver.Kind() != reflect.Chan {
+			resolver = resolver.Elem()
+		}
+	}
+
+	var wg sync.WaitGroup
+	var l []interface{}
+
+	// Store lLen separately, in the case we are streaming and don't want to waste space on l.
+	lLen := 0
+	serial := r.serial
+	stream := !serial && parentField != nil && streamByDirective(r, parentField.Directives)
+
+	if !stream {
+		l = make([]interface{}, 0)
+	}
+
+	hasValues := true
+	for hasValues {
+		chosen, recvVal, recvOk := reflect.Select([]reflect.SelectCase{
+			{
+				Chan: resolver,
+				Dir:  reflect.SelectRecv,
+			},
+			{
+				Chan: doneVal,
+				Dir:  reflect.SelectRecv,
+			},
+		})
+
+		switch chosen {
+		case 0:
+			if !recvOk {
+				hasValues = false
+				break
+			}
+
+			// Take the value and start resolving it.
+			idx := lLen
+			rval := recvVal
+			if stream {
+				lLen++
+				r.liveWg.Add(1)
+			} else {
+				wg.Add(1)
+				l = append(l, nil)
+				lLen = len(l)
+			}
+
+			reslv := func(i int) {
+				if stream {
+					defer r.liveWg.Done()
+				} else {
+					defer wg.Done()
+				}
+				defer r.handlePanic()
+				path := path.Append(i)
+				result := e.elem.exec(ctx, r, selSet, rval, path, nil)
+				if stream {
+					select {
+					case r.liveChan <- response.ConstructLiveResponse(path, result, nil):
+					case <-done:
+					}
+				} else {
+					l[i] = result
+				}
+			}
+
+			if serial {
+				reslv(idx)
+			} else {
+				go reslv(idx)
+			}
+		case 1:
+			// If <-done, then the request was canceled.
+			return l
+		}
+	}
+
+	if !stream {
+		wg.Wait()
+	}
+	return l
+}
+
+type addResultFn func(key string, value interface{}, errors []*errors.QueryError)
+type addResultDeferredFn func(key string, value interface{}, errors []*errors.QueryError, wasDeferred bool)
+
 type objectExec struct {
 	name           string
 	fields         map[string]*fieldExec
@@ -463,9 +579,6 @@ type objectExec struct {
 	typeAssertions map[string]*typeAssertExec
 	nonNull        bool
 }
-
-type addResultFn func(key string, value interface{}, errors []*errors.QueryError)
-type addResultDeferredFn func(key string, value interface{}, errors []*errors.QueryError, wasDeferred bool)
 
 func (e *objectExec) exec(ctx context.Context, r *request, selSet *query.SelectionSet, resolver reflect.Value, path FieldPath, parentField *query.Field) interface{} {
 	ctxDone := ctx.Done()
