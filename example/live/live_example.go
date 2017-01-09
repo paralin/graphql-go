@@ -6,9 +6,9 @@ import (
 	"os"
 	"time"
 
+	"context"
 	"github.com/neelance/graphql-go"
 	"github.com/neelance/graphql-go/response"
-	"golang.org/x/net/context"
 )
 
 // To demonstrate the live capabilities,
@@ -18,6 +18,7 @@ var Schema string = `
 type Region {
   id: String
   name: String
+  status: Int
 }
 
 type RootQuery {
@@ -42,9 +43,10 @@ func (r *RootResolver) Regions() <-chan *RegionResolver {
 				delay: time.Duration(0),
 			},
 			{
-				id:    "test2",
-				name:  "test region, delayed by 500ms",
-				delay: time.Duration(500) * time.Millisecond,
+				id:     "test2",
+				name:   "test region, delayed by 500ms",
+				delay:  time.Duration(500) * time.Millisecond,
+				doLive: true,
 			},
 			{
 				id:    "test3",
@@ -62,9 +64,10 @@ func (r *RootResolver) Regions() <-chan *RegionResolver {
 }
 
 type RegionResolver struct {
-	id    string
-	name  string
-	delay time.Duration
+	id     string
+	name   string
+	delay  time.Duration
+	doLive bool
 }
 
 func (r *RegionResolver) Id() *string {
@@ -82,6 +85,37 @@ func (r *RegionResolver) Name() *string {
 	return &r.name
 }
 
+func (r *RegionResolver) Status(ctx context.Context) <-chan int {
+	ch := make(chan int, 1)
+
+	go func() {
+		done := ctx.Done()
+		defer close(ch)
+		i := 0
+		for {
+			i++
+			select {
+			case <-done:
+				return
+			case <-time.After(time.Duration(1) * time.Second):
+				select {
+				case <-done:
+					return
+				case ch <- i:
+					if !r.doLive {
+						return
+					}
+					if i >= 10 {
+						return
+					}
+				}
+			}
+		}
+	}()
+
+	return ch
+}
+
 func main() {
 	if err := realMain(); err != nil {
 		fmt.Printf("Error: %v\n", err.Error())
@@ -95,28 +129,31 @@ func realMain() error {
 		return err
 	}
 	query := `
-fragment regionDetails on Region {
-  name
-}
-
 query regions {
   regions @stream {
     __typename
     id
-    ...regionDetails @defer
+    name @defer
+    status @live
   }
 }
 `
+
+	fmt.Printf("Query:\n%s\n\nResponse stream:\n", query)
 
 	ch := make(chan *response.Response, 1)
 	resp := schema.ExecLive(context.Background(), query, "", make(map[string]interface{}), ch)
 
 	dat, _ := json.Marshal(resp)
-	fmt.Printf("Initial: %s\n", string(dat))
+	fmt.Printf("%s\n", string(dat))
 
 	for ent := range ch {
-		dat, _ = json.Marshal(ent)
-		fmt.Printf("Live: %s\n", string(dat))
+		dat, err = json.Marshal(ent)
+		if err != nil {
+			fmt.Printf("Err: %v\n", err)
+		} else {
+			fmt.Printf("%s\n", string(dat))
+		}
 	}
 	fmt.Printf("Done\n")
 	return nil

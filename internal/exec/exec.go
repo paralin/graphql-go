@@ -103,8 +103,8 @@ func makeExec2(s *schema.Schema, t common.Type, resolverType reflect.Type, typeR
 	var nonNull bool
 	t, nonNull = unwrapNonNull(t)
 
+	resolverTypeKind := resolverType.Kind()
 	if !nonNull {
-		resolverTypeKind := resolverType.Kind()
 		if resolverTypeKind != reflect.Ptr &&
 			resolverTypeKind != reflect.Interface &&
 			resolverTypeKind != reflect.Chan &&
@@ -115,12 +115,23 @@ func makeExec2(s *schema.Schema, t common.Type, resolverType reflect.Type, typeR
 
 	switch t := t.(type) {
 	case *schema.Scalar:
+		isChan := resolverTypeKind == reflect.Chan
+		if isChan {
+			resolverType = resolverType.Elem()
+		}
 		if u, ok := reflect.New(resolverType).Interface().(Unmarshaler); ok {
 			if !u.ImplementsGraphQLType(t.Name) {
 				return nil, fmt.Errorf("can not use %s as %s", resolverType, t.Name)
 			}
 		}
-		return &scalarExec{}, nil
+		if isChan {
+			return &chanFieldExec{
+				elem:    &scalarExec{},
+				nonNull: false,
+			}, nil
+		} else {
+			return &scalarExec{}, nil
+		}
 
 	case *schema.Object:
 		fields, err := makeFieldExecs(s, t.Name, t.Fields, resolverType, typeRefMap)
@@ -183,7 +194,7 @@ func makeExec2(s *schema.Schema, t common.Type, resolverType reflect.Type, typeR
 			if resolverType.ChanDir() != reflect.RecvDir {
 				return nil, fmt.Errorf("%s must be a recv chan (<-*ResolverType)", resolverType)
 			}
-			e := &chanExec{nonNull: nonNull}
+			e := &chanListExec{nonNull: nonNull}
 			if err := makeExec(&e.elem, s, t.OfType, resolverType.Elem(), typeRefMap); err != nil {
 				return nil, err
 			}
@@ -472,12 +483,120 @@ func (e *listExec) exec(ctx context.Context, r *request, selSet *query.Selection
 	return l
 }
 
-type chanExec struct {
+// Resolve a channel treated as a field value (@live or first value)
+type chanFieldExec struct {
 	elem    iExec
 	nonNull bool
 }
 
-func (e *chanExec) exec(ctx context.Context, r *request, selSet *query.SelectionSet, resolver reflect.Value, path FieldPath, parentField *query.Field) interface{} {
+func (e *chanFieldExec) exec(ctx context.Context, r *request, selSet *query.SelectionSet, resolver reflect.Value, path FieldPath, parentField *query.Field) interface{} {
+	done := ctx.Done()
+	doneVal := reflect.ValueOf(done)
+	if !e.nonNull {
+		if resolver.IsNil() {
+			return nil
+		}
+	}
+
+	var wg sync.WaitGroup
+	var result interface{}
+	subCtx, subCtxCancel := context.WithCancel(ctx)
+
+	serial := r.serial
+	live := !serial && parentField != nil && liveByDirective(r, parentField.Directives)
+
+	if live {
+		r.liveWg.Add(1)
+	} else {
+		wg.Add(1)
+	}
+
+	resolveField := func() {
+		if live {
+			defer r.liveWg.Done()
+		} else {
+			defer wg.Done()
+		}
+
+		hasValues := true
+		for hasValues {
+			chosen, recvVal, recvOk := reflect.Select([]reflect.SelectCase{
+				{
+					Chan: resolver,
+					Dir:  reflect.SelectRecv,
+				},
+				{
+					Chan: doneVal,
+					Dir:  reflect.SelectRecv,
+				},
+			})
+
+			switch chosen {
+			case 0:
+				if !recvOk {
+					subCtxCancel()
+					return
+				}
+
+				// Take the value and start resolving it.
+				rval := recvVal
+				if live {
+					r.liveWg.Add(1)
+				} else {
+					wg.Add(1)
+				}
+
+				reslv := func() {
+					if live {
+						defer r.liveWg.Done()
+					} else {
+						defer wg.Done()
+					}
+					defer r.handlePanic()
+					execRes := e.elem.exec(subCtx, r, selSet, rval, path, nil)
+					if live {
+						select {
+						case r.liveChan <- response.ConstructLiveResponse(path, execRes, nil):
+						case <-done:
+						}
+					} else {
+						result = execRes
+					}
+				}
+
+				if serial {
+					reslv()
+				} else {
+					go reslv()
+				}
+
+				if !live {
+					return
+				}
+			case 1:
+				// If <-done, then the request was canceled.
+				subCtxCancel()
+				return
+			}
+		}
+	}
+
+	go resolveField()
+
+	if !live {
+		wg.Wait()
+		subCtxCancel()
+	}
+	return result
+}
+
+// Resolve a channel treated as a list (stream of values)
+type chanListExec struct {
+	elem    iExec
+	nonNull bool
+}
+
+func (e *chanListExec) exec(ctx context.Context, r *request, selSet *query.SelectionSet, resolver reflect.Value, path FieldPath, parentField *query.Field) interface{} {
 	done := ctx.Done()
 	doneVal := reflect.ValueOf(done)
 	if !e.nonNull {
@@ -862,6 +981,14 @@ func streamByDirective(r *request, d map[string]*query.Directive) bool {
 		return false
 	}
 	_, ok := d["stream"]
+	return ok
+}
+
+func liveByDirective(r *request, d map[string]*query.Directive) bool {
+	if r.liveChan == nil {
+		return false
+	}
+	_, ok := d["live"]
 	return ok
 }
 
