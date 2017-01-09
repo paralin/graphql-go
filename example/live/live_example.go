@@ -35,15 +35,27 @@ type RootResolver struct {
 func (r *RootResolver) Regions() *[]*RegionResolver {
 	return &[]*RegionResolver{
 		{
-			id:   "test",
-			name: "test region",
+			id:    "test",
+			name:  "test region",
+			delay: time.Duration(0),
+		},
+		{
+			id:    "test2",
+			name:  "test region, delayed by 500ms",
+			delay: time.Duration(500) * time.Millisecond,
+		},
+		{
+			id:    "test3",
+			name:  "test region, delayed by 1sec",
+			delay: time.Duration(1) * time.Second,
 		},
 	}
 }
 
 type RegionResolver struct {
-	id   string
-	name string
+	id    string
+	name  string
+	delay time.Duration
 }
 
 func (r *RegionResolver) Id() *string {
@@ -57,7 +69,7 @@ func (r *RegionResolver) Name() *string {
 	// even if it is @deferred.
 	// Since the resolver returns instantly,
 	// GraphQL-Go detects there's no advantage to deferring it.
-	time.Sleep(time.Duration(1) * time.Second)
+	time.Sleep(r.delay)
 	return &r.name
 }
 
@@ -79,7 +91,7 @@ fragment regionDetails on Region {
 }
 
 query regions {
-  regions {
+  regions @stream {
     __typename
     id
     ...regionDetails @defer

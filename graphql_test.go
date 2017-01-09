@@ -1216,6 +1216,14 @@ func TestIntrospection(t *testing.T) {
 										"INLINE_FRAGMENT"
 									],
 									"name": "defer"
+								},
+								{
+									"args": [],
+									"description": "Directs the executor to send array elements in a stream over time after the initial response is complete.",
+									"locations": [
+										"FIELD"
+									],
+									"name": "stream"
 								}
 							]
 						}

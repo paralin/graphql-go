@@ -360,7 +360,7 @@ func ExecuteRequest(ctx context.Context, e *Exec, document *query.Document, oper
 
 	data := func() interface{} {
 		defer r.handlePanic()
-		return opExec.exec(ctx, r, op.SelSet, e.resolver, fp)
+		return opExec.exec(ctx, r, op.SelSet, e.resolver, fp, nil)
 	}()
 
 	// Wait for all of the live / deferred operations to finish.
@@ -396,12 +396,12 @@ func getOperation(document *query.Document, operationName string) (*query.Operat
 }
 
 type iExec interface {
-	exec(ctx context.Context, r *request, selSet *query.SelectionSet, resolver reflect.Value, path FieldPath) interface{}
+	exec(ctx context.Context, r *request, selSet *query.SelectionSet, resolver reflect.Value, path FieldPath, parentField *query.Field) interface{}
 }
 
 type scalarExec struct{}
 
-func (e *scalarExec) exec(ctx context.Context, r *request, selSet *query.SelectionSet, resolver reflect.Value, path FieldPath) interface{} {
+func (e *scalarExec) exec(ctx context.Context, r *request, selSet *query.SelectionSet, resolver reflect.Value, path FieldPath, parentField *query.Field) interface{} {
 	return resolver.Interface()
 }
 
@@ -410,7 +410,8 @@ type listExec struct {
 	nonNull bool
 }
 
-func (e *listExec) exec(ctx context.Context, r *request, selSet *query.SelectionSet, resolver reflect.Value, path FieldPath) interface{} {
+func (e *listExec) exec(ctx context.Context, r *request, selSet *query.SelectionSet, resolver reflect.Value, path FieldPath, parentField *query.Field) interface{} {
+	done := ctx.Done()
 	if !e.nonNull {
 		if resolver.IsNil() {
 			return nil
@@ -420,12 +421,30 @@ func (e *listExec) exec(ctx context.Context, r *request, selSet *query.Selection
 	l := make([]interface{}, resolver.Len())
 	var wg sync.WaitGroup
 	serial := r.serial
+	stream := !serial && parentField != nil && streamByDirective(r, parentField.Directives)
 	for i := range l {
-		wg.Add(1)
+		if stream {
+			r.liveWg.Add(1)
+		} else {
+			wg.Add(1)
+		}
 		reslv := func(i int) {
-			defer wg.Done()
+			if stream {
+				defer r.liveWg.Done()
+			} else {
+				defer wg.Done()
+			}
 			defer r.handlePanic()
-			l[i] = e.elem.exec(ctx, r, selSet, resolver.Index(i), path.Append(i))
+			path := path.Append(i)
+			result := e.elem.exec(ctx, r, selSet, resolver.Index(i), path, nil)
+			if stream {
+				select {
+				case r.liveChan <- response.ConstructLiveResponse(path, result, nil):
+				case <-done:
+				}
+			} else {
+				l[i] = result
+			}
 		}
 		if serial {
 			reslv(i)
@@ -448,7 +467,7 @@ type objectExec struct {
 type addResultFn func(key string, value interface{}, errors []*errors.QueryError)
 type addResultDeferredFn func(key string, value interface{}, errors []*errors.QueryError, wasDeferred bool)
 
-func (e *objectExec) exec(ctx context.Context, r *request, selSet *query.SelectionSet, resolver reflect.Value, path FieldPath) interface{} {
+func (e *objectExec) exec(ctx context.Context, r *request, selSet *query.SelectionSet, resolver reflect.Value, path FieldPath, parentField *query.Field) interface{} {
 	ctxDone := ctx.Done()
 	if resolver.IsNil() {
 		if e.nonNull {
@@ -672,7 +691,7 @@ func (e *fieldExec) execField2(ctx context.Context, r *request, f *query.Field, 
 		return nil, out[1].Interface().(error)
 	}
 
-	return e.valueExec.exec(ctx, r, f.SelSet, out[0], path), nil
+	return e.valueExec.exec(ctx, r, f.SelSet, out[0], path, f), nil
 }
 
 type typeAssertExec struct {
@@ -706,15 +725,31 @@ func skipByDirective(r *request, d map[string]*query.Directive) bool {
 	return false
 }
 
+// Check if one of the directives implies that the field can be returned later.
 func deferByDirective(r *request, d map[string]*query.Directive) bool {
+	// If we are not provided a way of sending deferred responses, we will ignore these directives.
 	if r.liveChan == nil {
 		return false
 	}
 	if _, ok := d["defer"]; ok {
 		return true
 	}
+	if _, ok := d["live"]; ok {
+		return true
+	}
+	if _, ok := d["stream"]; ok {
+		return true
+	}
 
 	return false
+}
+
+func streamByDirective(r *request, d map[string]*query.Directive) bool {
+	if r.liveChan == nil {
+		return false
+	}
+	_, ok := d["stream"]
+	return ok
 }
 
 func unwrapNonNull(t common.Type) (common.Type, bool) {
