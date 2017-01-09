@@ -957,7 +957,7 @@ func skipByDirective(r *request, d map[string]*query.Directive) bool {
 	return false
 }
 
-// Check if one of the directives implies that the field can be returned later.
+// Check if one of the directives implies that the immediate field result can be returned later.
 func deferByDirective(r *request, d map[string]*query.Directive) bool {
 	// If we are not provided a way of sending deferred responses, we will ignore these directives.
 	if r.liveChan == nil {
@@ -967,9 +967,6 @@ func deferByDirective(r *request, d map[string]*query.Directive) bool {
 		return true
 	}
 	if _, ok := d["live"]; ok {
-		return true
-	}
-	if _, ok := d["stream"]; ok {
 		return true
 	}
 
