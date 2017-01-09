@@ -456,11 +456,6 @@ func (e *listExec) exec(ctx context.Context, r *request, selSet *query.Selection
 			wg.Add(1)
 		}
 		reslv := func(i int) {
-			if stream {
-				defer r.liveWg.Done()
-			} else {
-				defer wg.Done()
-			}
 			defer r.handlePanic()
 			path := path.Append(i)
 			result := e.elem.exec(ctx, r, selSet, resolver.Index(i), path, nil)
@@ -469,8 +464,10 @@ func (e *listExec) exec(ctx context.Context, r *request, selSet *query.Selection
 				case r.liveChan <- response.ConstructLiveResponse(path, result, nil):
 				case <-done:
 				}
+				r.liveWg.Done()
 			} else {
 				l[i] = result
+				wg.Done()
 			}
 		}
 		if serial {
@@ -653,11 +650,6 @@ func (e *chanListExec) exec(ctx context.Context, r *request, selSet *query.Selec
 			}
 
 			reslv := func(i int) {
-				if stream {
-					defer r.liveWg.Done()
-				} else {
-					defer wg.Done()
-				}
 				defer r.handlePanic()
 				path := path.Append(i)
 				result := e.elem.exec(ctx, r, selSet, rval, path, nil)
@@ -666,8 +658,10 @@ func (e *chanListExec) exec(ctx context.Context, r *request, selSet *query.Selec
 					case r.liveChan <- response.ConstructLiveResponse(path, result, nil):
 					case <-done:
 					}
+					r.liveWg.Done()
 				} else {
 					l[i] = result
+					wg.Done()
 				}
 			}
 
