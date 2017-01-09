@@ -40,7 +40,7 @@ func IntrospectSchema(s *schema.Schema) (interface{}, error) {
 }
 
 func introspectSchema(ctx context.Context, r *request, selSet *query.SelectionSet) interface{} {
-	return schemaExec.exec(ctx, r, selSet, reflect.ValueOf(&introspection.Schema{Schema: r.schema}))
+	return schemaExec.exec(ctx, r, selSet, reflect.ValueOf(&introspection.Schema{Schema: r.schema}), nil)
 }
 
 func introspectType(ctx context.Context, r *request, name string, selSet *query.SelectionSet) interface{} {
@@ -48,7 +48,7 @@ func introspectType(ctx context.Context, r *request, name string, selSet *query.
 	if !ok {
 		return nil
 	}
-	return typeExec.exec(ctx, r, selSet, reflect.ValueOf(&introspection.Type{t}))
+	return typeExec.exec(ctx, r, selSet, reflect.ValueOf(&introspection.Type{Typ: t}), nil)
 }
 
 var introspectionQuery *query.Document

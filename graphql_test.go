@@ -1209,9 +1209,11 @@ func TestIntrospection(t *testing.T) {
 								},
 								{
 									"args": [],
-									"description": "Directs the executor to defer resolving this field until the initial query is complete.",
+									"description": "Directs the executor to defer resolving this field or fragment until the initial response is complete.",
 									"locations": [
-										"FIELD"
+										"FIELD",
+										"FRAGMENT_SPREAD",
+										"INLINE_FRAGMENT"
 									],
 									"name": "defer"
 								}

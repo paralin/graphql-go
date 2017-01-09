@@ -16,6 +16,7 @@ import (
 	"github.com/neelance/graphql-go/internal/common"
 	"github.com/neelance/graphql-go/internal/query"
 	"github.com/neelance/graphql-go/internal/schema"
+	"github.com/neelance/graphql-go/response"
 )
 
 const OpenTracingTagType = "graphql.type"
@@ -285,13 +286,28 @@ func findMethod(t reflect.Type, name string) int {
 	return -1
 }
 
+type FieldPath []interface{}
+
+func (fp FieldPath) Append(segments ...interface{}) FieldPath {
+	if fp == nil {
+		return nil
+	}
+
+	narr := make([]interface{}, len(fp)+len(segments))
+	copy(narr, fp)
+	copy(narr[len(fp):], segments)
+	return FieldPath(narr)
+}
+
 type request struct {
-	doc    *query.Document
-	vars   map[string]interface{}
-	schema *schema.Schema
-	mu     sync.Mutex
-	errs   []*errors.QueryError
-	serial bool
+	doc      *query.Document
+	vars     map[string]interface{}
+	schema   *schema.Schema
+	mu       sync.Mutex
+	errs     []*errors.QueryError
+	serial   bool
+	liveChan chan<- *response.Response
+	liveWg   sync.WaitGroup
 }
 
 func (r *request) addError(err *errors.QueryError) {
@@ -312,10 +328,10 @@ func (r *request) handlePanic() {
 	}
 }
 
-func ExecuteRequest(ctx context.Context, e *Exec, document *query.Document, operationName string, variables map[string]interface{}) (interface{}, []*errors.QueryError) {
+func ExecuteRequest(ctx context.Context, e *Exec, document *query.Document, operationName string, variables map[string]interface{}, liveChan chan<- *response.Response) (interface{}, *sync.WaitGroup, []*errors.QueryError) {
 	op, err := getOperation(document, operationName)
 	if err != nil {
-		return nil, []*errors.QueryError{errors.Errorf("%s", err)}
+		return nil, nil, []*errors.QueryError{errors.Errorf("%s", err)}
 	}
 
 	var opExec iExec
@@ -330,18 +346,32 @@ func ExecuteRequest(ctx context.Context, e *Exec, document *query.Document, oper
 	}
 
 	r := &request{
-		doc:    document,
-		vars:   variables,
-		schema: e.schema,
-		serial: serially,
+		doc:      document,
+		vars:     variables,
+		schema:   e.schema,
+		serial:   serially,
+		liveChan: liveChan,
+	}
+
+	var fp FieldPath
+	if liveChan != nil {
+		fp = FieldPath([]interface{}{})
 	}
 
 	data := func() interface{} {
 		defer r.handlePanic()
-		return opExec.exec(ctx, r, op.SelSet, e.resolver)
+		return opExec.exec(ctx, r, op.SelSet, e.resolver, fp)
 	}()
 
-	return data, r.errs
+	// Wait for all of the live / deferred operations to finish.
+	if r.liveChan != nil {
+		go func() {
+			r.liveWg.Wait()
+			close(r.liveChan)
+		}()
+	}
+
+	return data, &r.liveWg, r.errs
 }
 
 func getOperation(document *query.Document, operationName string) (*query.Operation, error) {
@@ -366,12 +396,12 @@ func getOperation(document *query.Document, operationName string) (*query.Operat
 }
 
 type iExec interface {
-	exec(ctx context.Context, r *request, selSet *query.SelectionSet, resolver reflect.Value) interface{}
+	exec(ctx context.Context, r *request, selSet *query.SelectionSet, resolver reflect.Value, path FieldPath) interface{}
 }
 
 type scalarExec struct{}
 
-func (e *scalarExec) exec(ctx context.Context, r *request, selSet *query.SelectionSet, resolver reflect.Value) interface{} {
+func (e *scalarExec) exec(ctx context.Context, r *request, selSet *query.SelectionSet, resolver reflect.Value, path FieldPath) interface{} {
 	return resolver.Interface()
 }
 
@@ -380,7 +410,7 @@ type listExec struct {
 	nonNull bool
 }
 
-func (e *listExec) exec(ctx context.Context, r *request, selSet *query.SelectionSet, resolver reflect.Value) interface{} {
+func (e *listExec) exec(ctx context.Context, r *request, selSet *query.SelectionSet, resolver reflect.Value, path FieldPath) interface{} {
 	if !e.nonNull {
 		if resolver.IsNil() {
 			return nil
@@ -395,7 +425,7 @@ func (e *listExec) exec(ctx context.Context, r *request, selSet *query.Selection
 		reslv := func(i int) {
 			defer wg.Done()
 			defer r.handlePanic()
-			l[i] = e.elem.exec(ctx, r, selSet, resolver.Index(i))
+			l[i] = e.elem.exec(ctx, r, selSet, resolver.Index(i), path.Append(i))
 		}
 		if serial {
 			reslv(i)
@@ -415,9 +445,11 @@ type objectExec struct {
 	nonNull        bool
 }
 
-type addResultFn func(key string, value interface{})
+type addResultFn func(key string, value interface{}, errors []*errors.QueryError)
+type addResultDeferredFn func(key string, value interface{}, errors []*errors.QueryError, wasDeferred bool)
 
-func (e *objectExec) exec(ctx context.Context, r *request, selSet *query.SelectionSet, resolver reflect.Value) interface{} {
+func (e *objectExec) exec(ctx context.Context, r *request, selSet *query.SelectionSet, resolver reflect.Value, path FieldPath) interface{} {
+	ctxDone := ctx.Done()
 	if resolver.IsNil() {
 		if e.nonNull {
 			r.addError(errors.Errorf("got nil for non-null %q", e.name))
@@ -425,96 +457,140 @@ func (e *objectExec) exec(ctx context.Context, r *request, selSet *query.Selecti
 		return nil
 	}
 	var mu sync.Mutex
+	initialResultComplete := false
 	results := make(map[string]interface{})
-	addResult := func(key string, value interface{}) {
+	addResult := func(key string, value interface{}, errors []*errors.QueryError, wasDeferred bool) {
 		mu.Lock()
-		results[key] = value
-		mu.Unlock()
+		defer mu.Unlock()
+
+		// This will only happen when we have deferred / live / other fields.
+		if initialResultComplete {
+			lresp := response.ConstructLiveResponse(path.Append(key), value, errors)
+			select {
+			case r.liveChan <- lresp:
+			case <-ctxDone:
+				return
+			}
+		} else {
+			results[key] = value
+		}
+
+		if wasDeferred {
+			r.liveWg.Done()
+		}
 	}
-	e.execSelectionSet(ctx, r, selSet, resolver, addResult)
+
+	e.execSelectionSet(ctx, r, selSet, resolver, addResult, path)
+	initialResultComplete = true
 	return results
 }
 
-func (e *objectExec) execSelectionSet(ctx context.Context, r *request, selSet *query.SelectionSet, resolver reflect.Value, addResult addResultFn) {
+func (e *objectExec) execSelectionSet(ctx context.Context, r *request, selSet *query.SelectionSet, resolver reflect.Value, addResult addResultDeferredFn, path FieldPath) {
 	var wg sync.WaitGroup
 	for _, sel := range selSet.Selections {
-		execSel := func(f func()) {
+		execSel := func(f func(wasDeferred bool), deferSel bool) {
 			if r.serial {
 				defer r.handlePanic()
-				f()
+				f(false)
 				return
 			}
 
-			wg.Add(1)
+			if deferSel {
+				// addResult will decrement liveWg
+				r.liveWg.Add(1)
+			} else {
+				wg.Add(1)
+			}
 			go func() {
-				defer wg.Done()
+				if !deferSel {
+					defer wg.Done()
+				}
 				defer r.handlePanic()
-				f()
+				f(deferSel)
 			}()
 		}
 
 		switch sel := sel.(type) {
 		case *query.Field:
-			if !skipByDirective(r, sel.Directives) {
-				f := sel
-				execSel(func() {
-					switch f.Name {
-					case "__typename":
-						if e.isConcrete {
-							addResult(f.Alias, e.name)
-							return
-						}
-
-						for name, a := range e.typeAssertions {
-							out := resolver.Method(a.methodIndex).Call(nil)
-							if out[1].Bool() {
-								addResult(f.Alias, name)
-								return
-							}
-						}
-
-					case "__schema":
-						addResult(f.Alias, introspectSchema(ctx, r, f.SelSet))
-
-					case "__type":
-						p := valuePacker{valueType: stringType}
-						v, err := p.pack(r, f.Arguments["name"])
-						if err != nil {
-							r.addError(errors.Errorf("%s", err))
-							addResult(f.Alias, nil)
-							return
-						}
-						addResult(f.Alias, introspectType(ctx, r, v.String(), f.SelSet))
-
-					default:
-						fe, ok := e.fields[f.Name]
-						if !ok {
-							panic(fmt.Errorf("%q has no field %q", e.name, f.Name)) // TODO proper error handling
-						}
-						fe.execField(ctx, r, f, resolver, addResult)
-					}
-				})
+			if skipByDirective(r, sel.Directives) {
+				break
 			}
+
+			f := sel
+			deferSel := deferByDirective(r, sel.Directives)
+			execSel(func(wasDeferred bool) {
+				addResultCb := func(key string, value interface{}, errors []*errors.QueryError) {
+					addResult(key, value, errors, wasDeferred)
+				}
+
+				switch f.Name {
+				case "__typename":
+					if e.isConcrete {
+						addResult(f.Alias, e.name, nil, wasDeferred)
+						return
+					}
+
+					for name, a := range e.typeAssertions {
+						out := resolver.Method(a.methodIndex).Call(nil)
+						if out[1].Bool() {
+							addResult(f.Alias, name, nil, wasDeferred)
+							return
+						}
+					}
+
+				case "__schema":
+					addResult(f.Alias, introspectSchema(ctx, r, f.SelSet), nil, wasDeferred)
+
+				case "__type":
+					p := valuePacker{valueType: stringType}
+					v, err := p.pack(r, f.Arguments["name"])
+					if err != nil {
+						r.addError(errors.Errorf("%s", err))
+						addResult(f.Alias, nil, nil, wasDeferred)
+						return
+					}
+					addResult(f.Alias, introspectType(ctx, r, v.String(), f.SelSet), nil, wasDeferred)
+
+				default:
+					fe, ok := e.fields[f.Name]
+					if !ok {
+						panic(fmt.Errorf("%q has no field %q", e.name, f.Name)) // TODO proper error handling
+					}
+					fe.execField(ctx, r, f, resolver, addResultCb, path.Append(f.Alias))
+				}
+			}, deferSel)
 
 		case *query.FragmentSpread:
-			if !skipByDirective(r, sel.Directives) {
-				fs := sel
-				execSel(func() {
-					frag, ok := r.doc.Fragments[fs.Name]
-					if !ok {
-						panic(fmt.Errorf("fragment %q not found", fs.Name)) // TODO proper error handling
-					}
-					e.execFragment(ctx, r, &frag.Fragment, resolver, addResult)
-				})
+			if skipByDirective(r, sel.Directives) {
+				break
 			}
 
+			fs := sel
+			deferSel := deferByDirective(r, sel.Directives)
+			execSel(func(wasDeferred bool) {
+				frag, ok := r.doc.Fragments[fs.Name]
+				if !ok {
+					panic(fmt.Errorf("fragment %q not found", fs.Name)) // TODO proper error handling
+				}
+				e.execFragment(ctx, r, &frag.Fragment, resolver, addResult, path)
+				if wasDeferred {
+					r.liveWg.Done()
+				}
+			}, deferSel)
+
 		case *query.InlineFragment:
-			if !skipByDirective(r, sel.Directives) {
-				frag := sel
-				execSel(func() {
-					e.execFragment(ctx, r, &frag.Fragment, resolver, addResult)
-				})
+			if skipByDirective(r, sel.Directives) {
+				break
 			}
+
+			frag := sel
+			deferSel := deferByDirective(r, sel.Directives)
+			execSel(func(wasDeferred bool) {
+				e.execFragment(ctx, r, &frag.Fragment, resolver, addResult, path)
+				if wasDeferred {
+					r.liveWg.Done()
+				}
+			}, deferSel)
 
 		default:
 			panic("invalid type")
@@ -523,7 +599,7 @@ func (e *objectExec) execSelectionSet(ctx context.Context, r *request, selSet *q
 	wg.Wait()
 }
 
-func (e *objectExec) execFragment(ctx context.Context, r *request, frag *query.Fragment, resolver reflect.Value, addResult addResultFn) {
+func (e *objectExec) execFragment(ctx context.Context, r *request, frag *query.Fragment, resolver reflect.Value, addResult addResultDeferredFn, path FieldPath) {
 	if frag.On != "" && frag.On != e.name {
 		a, ok := e.typeAssertions[frag.On]
 		if !ok {
@@ -533,10 +609,10 @@ func (e *objectExec) execFragment(ctx context.Context, r *request, frag *query.F
 		if !out[1].Bool() {
 			return
 		}
-		a.typeExec.(*objectExec).execSelectionSet(ctx, r, frag.SelSet, out[0], addResult)
+		a.typeExec.(*objectExec).execSelectionSet(ctx, r, frag.SelSet, out[0], addResult, path)
 		return
 	}
-	e.execSelectionSet(ctx, r, frag.SelSet, resolver, addResult)
+	e.execSelectionSet(ctx, r, frag.SelSet, resolver, addResult, path)
 }
 
 type fieldExec struct {
@@ -549,7 +625,7 @@ type fieldExec struct {
 	valueExec   iExec
 }
 
-func (e *fieldExec) execField(ctx context.Context, r *request, f *query.Field, resolver reflect.Value, addResult addResultFn) {
+func (e *fieldExec) execField(ctx context.Context, r *request, f *query.Field, resolver reflect.Value, addResult addResultFn, path FieldPath) {
 	span, spanCtx := opentracing.StartSpanFromContext(ctx, fmt.Sprintf("GraphQL field: %s.%s", e.typeName, e.field.Name))
 	defer span.Finish()
 	span.SetTag(OpenTracingTagType, e.typeName)
@@ -558,21 +634,21 @@ func (e *fieldExec) execField(ctx context.Context, r *request, f *query.Field, r
 		span.SetTag(OpenTracingTagTrivial, true)
 	}
 
-	result, err := e.execField2(spanCtx, r, f, resolver, span)
+	result, err := e.execField2(spanCtx, r, f, resolver, path, span)
 
 	if err != nil {
 		r.addError(errors.Errorf("%s", err))
-		addResult(f.Alias, nil) // TODO handle non-nil
+		addResult(f.Alias, nil, nil) // TODO handle non-nil
 
 		ext.Error.Set(span, true)
 		span.SetTag(OpenTracingTagError, err)
 		return
 	}
 
-	addResult(f.Alias, result)
+	addResult(f.Alias, result, nil)
 }
 
-func (e *fieldExec) execField2(ctx context.Context, r *request, f *query.Field, resolver reflect.Value, span opentracing.Span) (interface{}, error) {
+func (e *fieldExec) execField2(ctx context.Context, r *request, f *query.Field, resolver reflect.Value, path FieldPath, span opentracing.Span) (interface{}, error) {
 	var in []reflect.Value
 
 	if e.hasContext {
@@ -596,7 +672,7 @@ func (e *fieldExec) execField2(ctx context.Context, r *request, f *query.Field, 
 		return nil, out[1].Interface().(error)
 	}
 
-	return e.valueExec.exec(ctx, r, f.SelSet, out[0]), nil
+	return e.valueExec.exec(ctx, r, f.SelSet, out[0], path), nil
 }
 
 type typeAssertExec struct {
@@ -625,6 +701,17 @@ func skipByDirective(r *request, d map[string]*query.Directive) bool {
 		if err == nil && !v.Bool() {
 			return true
 		}
+	}
+
+	return false
+}
+
+func deferByDirective(r *request, d map[string]*query.Directive) bool {
+	if r.liveChan == nil {
+		return false
+	}
+	if _, ok := d["defer"]; ok {
+		return true
 	}
 
 	return false

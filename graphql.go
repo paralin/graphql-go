@@ -13,6 +13,7 @@ import (
 	"github.com/neelance/graphql-go/internal/query"
 	"github.com/neelance/graphql-go/internal/schema"
 	"github.com/neelance/graphql-go/introspection"
+	"github.com/neelance/graphql-go/response"
 )
 
 const OpenTracingTagQuery = "graphql.query"
@@ -73,25 +74,24 @@ type Schema struct {
 	exec   *exec.Exec
 }
 
-type Response struct {
-	Data       interface{}            `json:"data,omitempty"`
-	Errors     []*errors.QueryError   `json:"errors,omitempty"`
-	Extensions map[string]interface{} `json:"extensions,omitempty"`
-}
-
-func (s *Schema) Exec(ctx context.Context, queryString string, operationName string, variables map[string]interface{}) *Response {
+func (s *Schema) ExecLive(ctx context.Context, queryString string, operationName string, variables map[string]interface{}, liveChannel chan<- *response.Response) *response.Response {
 	if s.exec == nil {
 		panic("schema created without resolver, can not exec")
 	}
 
 	document, err := query.Parse(queryString, s.schema.Resolve)
 	if err != nil {
-		return &Response{
+		return &response.Response{
 			Errors: []*errors.QueryError{err},
 		}
 	}
 
-	span, subCtx := opentracing.StartSpanFromContext(ctx, "GraphQL request")
+	spanName := "GraphQL request"
+	if liveChannel != nil {
+		spanName = "GraphQL Live Request"
+	}
+
+	span, subCtx := opentracing.StartSpanFromContext(ctx, spanName)
 	span.SetTag(OpenTracingTagQuery, queryString)
 	if operationName != "" {
 		span.SetTag(OpenTracingTagOperationName, operationName)
@@ -99,17 +99,28 @@ func (s *Schema) Exec(ctx context.Context, queryString string, operationName str
 	if len(variables) != 0 {
 		span.SetTag(OpenTracingTagVariables, variables)
 	}
-	defer span.Finish()
 
-	data, errs := exec.ExecuteRequest(subCtx, s.exec, document, operationName, variables)
+	data, liveWg, errs := exec.ExecuteRequest(subCtx, s.exec, document, operationName, variables, liveChannel)
 	if len(errs) != 0 {
 		ext.Error.Set(span, true)
 		span.SetTag(OpenTracingTagError, errs)
 	}
-	return &Response{
+	if liveChannel == nil || liveWg == nil {
+		defer span.Finish()
+	} else {
+		go func() {
+			liveWg.Wait()
+			span.Finish()
+		}()
+	}
+	return &response.Response{
 		Data:   data,
 		Errors: errs,
 	}
+}
+
+func (s *Schema) Exec(ctx context.Context, queryString string, operationName string, variables map[string]interface{}) *response.Response {
+	return s.ExecLive(ctx, queryString, operationName, variables, nil)
 }
 
 func (s *Schema) Inspect() *introspection.Schema {
