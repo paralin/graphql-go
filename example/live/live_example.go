@@ -134,7 +134,7 @@ query regions {
     __typename
     id
     name @defer
-    status @live
+    status @live @defer
   }
 }
 `

@@ -504,21 +504,22 @@ func (e *chanFieldExec) exec(ctx context.Context, r *request, selSet *query.Sele
 
 	serial := r.serial
 	live := !serial && parentField != nil && liveByDirective(r, parentField.Directives)
+	deferInitial := !serial && parentField != nil && deferByDirective(r, parentField.Directives)
 
 	if live {
 		r.liveWg.Add(1)
-	} else {
+	}
+	if !live || !deferInitial {
 		wg.Add(1)
 	}
 
 	resolveField := func() {
 		if live {
 			defer r.liveWg.Done()
-		} else {
-			defer wg.Done()
 		}
 
 		hasValues := true
+		initialComplete := false
 		for hasValues {
 			chosen, recvVal, recvOk := reflect.Select([]reflect.SelectCase{
 				{
@@ -542,25 +543,25 @@ func (e *chanFieldExec) exec(ctx context.Context, r *request, selSet *query.Sele
 				rval := recvVal
 				if live {
 					r.liveWg.Add(1)
-				} else {
-					wg.Add(1)
 				}
 
 				reslv := func() {
 					if live {
 						defer r.liveWg.Done()
-					} else {
-						defer wg.Done()
 					}
 					defer r.handlePanic()
 					execRes := e.elem.exec(subCtx, r, selSet, rval, path, nil)
-					if live {
+					if live && (initialComplete || deferInitial) {
 						select {
 						case r.liveChan <- response.ConstructLiveResponse(path, execRes, nil):
 						case <-done:
 						}
 					} else {
 						result = execRes
+						if !initialComplete {
+							wg.Done()
+						}
+						initialComplete = true
 					}
 				}
 
@@ -583,9 +584,8 @@ func (e *chanFieldExec) exec(ctx context.Context, r *request, selSet *query.Sele
 
 	go resolveField()
 
-	if !live {
+	if !live || !deferInitial {
 		wg.Wait()
-		subCtxCancel()
 	}
 	return result
 }
@@ -768,7 +768,7 @@ func (e *objectExec) execSelectionSet(ctx context.Context, r *request, selSet *q
 			}
 
 			f := sel
-			deferSel := deferByDirective(r, sel.Directives)
+			deferSel := deferByDirective(r, sel.Directives) || streamByDirective(r, sel.Directives)
 			execSel(func(wasDeferred bool) {
 				addResultCb := func(key string, value interface{}, errors []*errors.QueryError) {
 					addResult(key, value, errors, wasDeferred)
@@ -964,9 +964,6 @@ func deferByDirective(r *request, d map[string]*query.Directive) bool {
 		return false
 	}
 	if _, ok := d["defer"]; ok {
-		return true
-	}
-	if _, ok := d["live"]; ok {
 		return true
 	}
 
